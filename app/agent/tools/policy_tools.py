@@ -3,13 +3,13 @@
 from sqlalchemy import select
 from app.agent.tools.base import AmountInput, read_tool
 from app.db.models import PaymentAttempt
-from app.services.payment_service import auto_payment_eligibility, list_rider_payments
+from app.services.payment_service import auto_payment_eligibility, traced_list_rider_payments
 
 
 def build_tools(context):
     def check_auto_payment_eligibility(amount):
         with context.payswift_factory() as client:
-            payments = list_rider_payments(client, context.rider_id)
+            payments = traced_list_rider_payments(context.session_factory, client, context.rider_id)
         with context.session_factory() as session:
             attempts = session.scalars(select(PaymentAttempt).where(PaymentAttempt.rider_id == context.rider_id)).all()
             return auto_payment_eligibility(amount, payments, attempts, context.now)

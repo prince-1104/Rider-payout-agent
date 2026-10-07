@@ -123,7 +123,7 @@ class TracedTool(StructuredTool):
             except Exception as exc:
                 self._recorder.finish(identifier, error=exc)
                 raise
-            self._recorder.finish(identifier, output=output)
+            self._recorder.finish(identifier, output=trace_tool_output(self.name, output))
             return output
 
     async def arun(self, tool_input, *args, **kwargs):
@@ -143,3 +143,42 @@ def trip_json(trip):
             "started_at": trip.started_at.isoformat(), "ist_date": to_ist_date(trip.started_at).isoformat(),
             "status": trip.status, "distance_km": str(trip.distance_km),
             "surge_multiplier": str(trip.surge_multiplier)}
+
+
+def trace_tool_output(name, output):
+    """Keep audit evidence useful while excluding profiles and full row dumps."""
+    if isinstance(output, list):
+        if name == "find_recent_trips":
+            return {"count": len(output), "statuses": sorted({row.get("status") for row in output}),
+                    "ist_dates": sorted({row.get("ist_date") for row in output})}
+        if name == "get_rider_payouts":
+            return {"count": len(output), "total_amount": sum(row.get("amount", 0) for row in output),
+                    "line_types": sorted({row.get("line_type") for row in output})}
+        if name == "get_payments_today":
+            return {"count": len(output), "total_amount": sum(row.get("amount", 0) for row in output),
+                    "statuses": sorted({row.get("status") for row in output})}
+        return {"count": len(output)}
+    if not isinstance(output, dict):
+        return output
+    fields = {
+        "get_rider_context": ("rider_id", "registered"),
+        "find_recent_trips": ("trip_id", "ist_date", "status"),
+        "get_trip": ("trip_id", "ist_date", "status"),
+        "get_rider_payouts": ("payout_date", "line_type", "amount"),
+        "calculate_trip_expected_payout": ("trip_id", "expected_amount"),
+        "calculate_daily_incentive": ("date", "completed_trips_count", "expected_amount", "eligible"),
+        "reconcile_trip_payout": ("dispute_id", "dispute_type", "trip_id", "dispute_date", "status",
+                                   "expected_amount", "actual_amount", "amount_owed"),
+        "reconcile_daily_incentive": ("dispute_id", "dispute_type", "dispute_date", "status",
+                                       "expected_amount", "actual_amount", "amount_owed"),
+        "reconcile_cancellation_penalties": ("dispute_id", "dispute_type", "dispute_date", "status",
+                                              "expected_amount", "actual_amount", "amount_owed"),
+        "get_dispute_status": ("dispute_id", "dispute_type", "trip_id", "dispute_date", "status",
+                               "expected_amount", "actual_amount", "amount_owed"),
+        "check_auto_payment_eligibility": ("eligible", "reason", "limit", "date"),
+        "get_payments_today": ("amount", "status"),
+    }
+    selected = {field: output[field] for field in fields.get(name, ()) if field in output}
+    if name == "get_rider_context":
+        selected["active_dispute_count"] = len(output.get("active_dispute_ids", []))
+    return selected

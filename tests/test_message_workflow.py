@@ -105,7 +105,20 @@ def test_webhook_normal_payout_uses_deterministic_amount(webhook, session_factor
     with session_factory() as session:
         message = session.scalar(select(InboundMessage).where(InboundMessage.message_id == "IN-1"))
         assert message.reply == response.json()["reply"] and message.workflow_state
-        assert get_trace(session, "R003")
+        trace = get_trace(session, "R003")
+        names = [step.name for step in trace]
+        for required in ("incoming_message", "idempotency_decision", "load_or_create_conversation",
+                         "conversation_agent", "get_trip", "get_rider_payouts",
+                         "calculate_trip_expected_payout", "deterministic_dispute_engine",
+                         "deterministic_policy_engine", "payment_authorization",
+                         "payswift_get_payouts", "payswift_create_payout", "final_response"):
+            assert required in names
+        assert [step.at for step in trace] == sorted(step.at for step in trace)
+        assert {step.type for step in trace} <= {"message_in", "tool_call", "decision", "reply", "error"}
+        assert "T926334 surge is missing" not in str([(step.input, step.output) for step in trace])
+        assert "9999" not in str([(step.input, step.output) for step in trace])
+        resolution = next(step for step in trace if step.name == "resolution_agent")
+        assert resolution.output == {"recommendation": "received", "financial_authority": "deterministic_policy"}
 
 
 def test_webhook_approval_and_escalation(webhook):
@@ -116,6 +129,7 @@ def test_webhook_approval_and_escalation(webhook):
             "text": "19 Sep payout wrong", "received_at": "2026-09-22T09:05:00+05:30"})
         assert response.status_code == 200 and "requires ops approval" in response.json()["reply"]
         assert client.get("/ops/pending").json()[0]["type"] == "approval"
+        assert "approval_creation" in [step["name"] for step in client.get("/trace/R016").json()]
 
     blocked = StructuredMock(lambda _: extraction(claim("unknown")))
     with build(blocked) as client:
@@ -124,6 +138,7 @@ def test_webhook_approval_and_escalation(webhook):
         assert response.status_code == 200 and "queued for ops review" in response.json()["reply"]
         escalation = [item for item in client.get("/ops/pending").json() if item["rider_id"] == "R003"]
         assert escalation[0]["type"] == "escalation"
+        assert "escalation" in [step["name"] for step in client.get("/trace/R003").json()]
     assert not [call for call in provider.calls if call.method == "POST"]
 
 
@@ -137,6 +152,12 @@ def test_duplicate_webhook_replays_exact_reply_without_financial_rerun(webhook):
     assert second.json() == first.json()
     assert len(model.calls) == 3
     assert len([call for call in provider.calls if call.method == "POST"]) == 1
+    with build(model) as client:
+        # A third replay adds only ingress/idempotency audit events.
+        assert send(client, "IN-DUP", "T926334 surge missing").json() == first.json()
+        names = [step["name"] for step in client.get("/trace/R003").json()]
+        assert names.count("incoming_message") == 3
+        assert names.count("conversation_agent") == 1
 
 
 def test_multi_turn_webhook_resumes_owned_dispute(webhook):
@@ -183,6 +204,9 @@ def test_prompt_injection_webhook_escalates_without_payment(webhook):
         assert response.status_code == 200
         assert "cannot follow requests" in response.json()["reply"]
         assert client.get("/ops/pending").json()[0]["type"] == "escalation"
+        trace = client.get("/trace/R003").json()
+        assert "final_response" in [step["name"] for step in trace]
+        assert "escalation" in [step["name"] for step in trace]
     assert provider.calls == []
     assert model.calls == []
 

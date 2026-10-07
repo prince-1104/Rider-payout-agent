@@ -52,18 +52,39 @@ class MessageWorkflow:
 
     def prepare(self, payload):
         """Persist the original delivery before executing any financial workflow."""
-        with self.sessions() as session:
-            registration = register_inbound_message(session, payload)
-            message = registration.message
-            session.commit()
-            if message.reply is not None:
-                return message.reply, None
-            # A retry always uses original persisted identity, text and timestamp.
-            original = payload.model_validate({"message_id": message.message_id, "rider_id": message.rider_id,
-                "text": message.text, "received_at": self._aware(message.received_at)})
-            conversation = ConversationService(session).get_or_create_conversation(message.rider_id)
-            conversation_id = conversation.conversation_id
-            session.commit()
+        recorder = TraceRecorder(self.sessions, payload.rider_id)
+        incoming = recorder.start("incoming_message", {"message_id": payload.message_id,
+            "received_at": payload.received_at}, kind="message_in")
+        try:
+            with self.sessions() as session:
+                registration = register_inbound_message(session, payload)
+                message = registration.message
+                session.commit()
+                cached_reply = message.reply
+                # A retry always uses original persisted identity, text and timestamp.
+                original = payload.model_validate({"message_id": message.message_id, "rider_id": message.rider_id,
+                    "text": message.text, "received_at": self._aware(message.received_at)})
+            recorder.finish(incoming, output={"persisted": True})
+        except Exception as exc:
+            recorder.finish(incoming, error=exc)
+            raise
+        decision = recorder.start("idempotency_decision", {"message_id": payload.message_id}, kind="decision")
+        recorder.finish(decision, output={"duplicate": registration.is_duplicate,
+            "reply_cached": cached_reply is not None,
+            "decision": "replay" if cached_reply is not None else "continue"})
+        if cached_reply is not None:
+            return cached_reply, None
+        conversation_step = recorder.start("load_or_create_conversation",
+            {"message_id": original.message_id}, kind="decision")
+        try:
+            with self.sessions() as session:
+                conversation = ConversationService(session).get_or_create_conversation(original.rider_id)
+                conversation_id = conversation.conversation_id
+                session.commit()
+            recorder.finish(conversation_step, output={"conversation_id": conversation_id, "created_or_loaded": True})
+        except Exception as exc:
+            recorder.finish(conversation_step, error=exc)
+            raise
         return None, (original, conversation_id)
 
     @staticmethod

@@ -26,7 +26,7 @@ from app.schemas.trace import TraceStep
 from app.services.conversation_service import ConversationAccessError, ConversationService
 from app.services.dispute_service import DisputeService
 from app.services.ops_service import OpsService
-from app.services.payment_service import PaymentService, list_rider_payments
+from app.services.payment_service import PaymentService, traced_list_rider_payments
 from app.services.trace import TraceRecorder
 
 
@@ -51,7 +51,7 @@ class Orchestrator:
         self.payments = PaymentService(context.session_factory, payswift_factory=context.payswift_factory,
                                        clock=lambda: context.now, execution_guard=payment_guard)
 
-    def _step(self, state, name, inputs, function, *, agent=False, kind="decision"):
+    def _step(self, state, name, inputs, function, *, agent=False, kind="decision", trace_output=None):
         inputs = redact_secrets(inputs)
         identifier = self.recorder.start(name, inputs, kind=kind)
         at = datetime.now(timezone.utc)
@@ -68,7 +68,7 @@ class Orchestrator:
             state.trace.append(TraceStep(at=at, type="error", name=name,
                                          input=inputs, output={"error": type(exc).__name__}))
             raise
-        encoded = jsonable_encoder(output)
+        encoded = jsonable_encoder(output if trace_output is None else trace_output(output))
         self.recorder.finish(identifier, output=encoded)
         state.trace.append(TraceStep(at=at, type=kind, name=name, input=inputs, output=encoded))
         return output
@@ -80,7 +80,8 @@ class Orchestrator:
         state = AgentState(rider_id=self.context.rider_id, conversation_id=conversation_id,
                            latest_message=latest_message)
         replay = self._step(state, "load_conversation", {"conversation_id": conversation_id, "message_id": message_id},
-                            lambda: self._load(state, message_id, received_at), kind="message_in")
+                            lambda: self._load(state, message_id, received_at), kind="message_in",
+                            trace_output=lambda value: {"replayed": value is not None})
         if replay is not None:
             state.reply = replay
             return state
@@ -89,21 +90,37 @@ class Orchestrator:
                 lambda: classify_input(latest_message, state.rider_id))
             if classification.blocked:
                 raise PromptInjectionDetected(classification.flags)
-            extracted = self._step(state, "conversation_agent", {"latest_message": latest_message},
+            extracted = self._step(state, "conversation_agent", {"message_id": message_id,
+                "character_count": len(latest_message), "history_count": len(state.conversation_history)},
                 lambda: self.conversation_agent.invoke(self._conversation_payload(state)), agent=True)
             state.claims = self._step(state, "validate_claims", extracted.model_dump(mode="json"),
-                                      lambda: self._validate_claims(state, extracted))
+                lambda: self._validate_claims(state, extracted), trace_output=lambda claims: {
+                    "count": len(claims), "claims": [{"dispute_id": c.dispute_id,
+                        "dispute_type": c.dispute_type.value, "trip_id": c.trip_id,
+                        "dispute_date": c.dispute_date.isoformat() if c.dispute_date else None} for c in claims]})
             state.investigation_results = self._step(state, "investigation_agent",
-                {"claims": [c.model_dump(mode="json") for c in state.claims]},
-                lambda: self.investigation_agent.investigate(state.claims, self.tools, self.context.today), agent=True)
+                {"claims": [claim_data(c) for c in state.claims]},
+                lambda: self.investigation_agent.investigate(state.claims, self.tools, self.context.today), agent=True,
+                trace_output=lambda results: [{"dispute_id": r.dispute_id,
+                    "evidence_tools": sorted(r.evidence.keys())} for r in results])
             state.validated_disputes = self._step(state, "deterministic_dispute_engine", {},
-                                                  lambda: self._evaluate(state))
+                lambda: self._evaluate(state), trace_output=lambda results: [{
+                    "dispute_id": d.dispute_id, "dispute_type": d.dispute_type.value,
+                    "dispute_date": d.dispute_date.isoformat() if d.dispute_date else None,
+                    "status": d.status.value, "expected_amount": d.expected_amount,
+                    "actual_amount": d.actual_amount, "amount_owed": d.amount_owed,
+                } for d in results])
             state.policy_decision = self._step(state, "deterministic_policy_engine", {},
                 lambda: self._policy(state, extracted.needs_information))
-            self._step(state, "resolution_agent", {},
-                       lambda: self.resolution_agent.recommend(state.validated_disputes, state.policy_decision), agent=True)
+            self._step(state, "resolution_agent", {"decision_count": len(state.policy_decision)},
+                       lambda: self.resolution_agent.recommend(state.validated_disputes, state.policy_decision), agent=True,
+                       trace_output=lambda _: {"recommendation": "received", "financial_authority": "deterministic_policy"})
             state.execution_results = self._step(state, "application_execute", {},
-                                                  lambda: self._execute(state, message_id))
+                lambda: self._execute(state, message_id), trace_output=lambda outcomes: [{
+                    "dispute_id": item.get("dispute_id"), "action": item.get("action"),
+                    "amount": item.get("payment", {}).get("amount", item.get("amount")),
+                    "payment_status": item.get("payment", {}).get("status"),
+                    "ops_type": item.get("type")} for item in outcomes])
         except Exception as exc:
             # Malformed/unsafe LLM outputs and failed evidence reads never reach a write/payment tool.
             reason = "The automated investigation could not be safely completed; ops review is required"
@@ -212,9 +229,12 @@ class Orchestrator:
         if any(d.status == DisputeStatus.VALID for d in state.validated_disputes):
             def read_provider_ledger():
                 with self.context.payswift_factory() as provider:
-                    return list_rider_payments(provider, state.rider_id)
+                    return traced_list_rider_payments(self.context.session_factory, provider, state.rider_id)
             try:
-                payments = self._step(state, "policy_provider_ledger", {}, read_provider_ledger)
+                payments = self._step(state, "policy_provider_ledger", {}, read_provider_ledger,
+                    trace_output=lambda result: {"count": len(result),
+                        "statuses": sorted({p.status for p in result}),
+                        "total_amount": sum(p.amount for p in result)})
             except Exception:
                 available = False
         with self.context.session_factory() as session:
@@ -238,10 +258,14 @@ class Orchestrator:
                     output["action"] = decision.action.value
             if decision.action in {Action.OPS_APPROVAL, Action.ESCALATION}:
                 with self.context.session_factory() as session:
-                    output.update(OpsService(session).enqueue(state.rider_id, state.conversation_id,
+                    ops_record = OpsService(session).enqueue(state.rider_id, state.conversation_id,
                         dispute_id=decision.dispute_id, message_id=message_id,
-                        kind="approval" if decision.action == Action.OPS_APPROVAL else "escalation", reason=decision.reason))
+                        kind="approval" if decision.action == Action.OPS_APPROVAL else "escalation", reason=decision.reason)
                     session.commit()
+                ops_name = "approval_creation" if decision.action == Action.OPS_APPROVAL else "escalation"
+                ops_step = self.recorder.start(ops_name, {"dispute_id": decision.dispute_id}, kind="decision")
+                self.recorder.finish(ops_step, output={"type": ops_record["type"], "amount": ops_record["amount"]})
+                output.update(ops_record)
             elif decision.dispute_id and decision.action in {Action.AUTO_PAY, Action.NO_DISPUTE}:
                 with self.context.session_factory() as session:
                     stored = session.get(StoredDispute, decision.dispute_id)

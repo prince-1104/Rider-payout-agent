@@ -66,6 +66,20 @@ def list_rider_payments(client, rider_id: str) -> list[ProviderPayment]:
     return payments
 
 
+def traced_list_rider_payments(session_factory, client, rider_id: str) -> list[ProviderPayment]:
+    """Read PaySwift and persist concise ledger evidence, never raw records."""
+    recorder = TraceRecorder(session_factory, rider_id)
+    identifier = recorder.start("payswift_get_payouts", {"rider_id": rider_id}, kind="tool_call")
+    try:
+        payments = list_rider_payments(client, rider_id)
+    except Exception as exc:
+        recorder.finish(identifier, error=exc)
+        raise
+    recorder.finish(identifier, output={"count": len(payments), "statuses": sorted({p.status for p in payments}),
+        "total_amount": sum(p.amount for p in payments)})
+    return payments
+
+
 def auto_payment_eligibility(amount, payments, attempts, now: datetime) -> dict:
     today = to_ist_date(now)
     reason = "Eligible under amount/day rules; this is advisory and does not authorize payment"
@@ -136,7 +150,9 @@ class PaymentService:
         except Exception as exc:
             trace.finish(identifier, error=exc)
             raise
-        trace.finish(identifier, output=output)
+        payment = output.get("payment") or {}
+        trace.finish(identifier, output={key: output[key] for key in ("action", "status", "amount", "reason")
+            if key in output} | {"payment_status": payment.get("status") if payment else None})
         return output
 
     @staticmethod
@@ -144,16 +160,30 @@ class PaymentService:
         return {"attempt_id": attempt.attempt_id, "amount": attempt.amount,
                 "status": attempt.status, "payout_id": attempt.payout_id}
 
+    def _trace_authorization(self, rider_id, dispute_id, authorization):
+        recorder = TraceRecorder(self.session_factory, rider_id)
+        identifier = recorder.start("payment_authorization", {"dispute_id": dispute_id}, kind="decision")
+        recorder.finish(identifier, output={"action": authorization.action.value,
+            "amount": authorization.amount, "reason": authorization.reason})
+
     def _authorization_outcome(self, session, dispute, authorization, *, route):
         output = authorization.model_dump(mode="json")
+        ops_event = None
         if authorization.action == PaymentAction.OPS_APPROVAL or (route and authorization.action == PaymentAction.ESCALATION):
             output["ops_record"] = OpsService(session).enqueue(dispute.rider_id, dispute.conversation_id,
                 dispute_id=dispute.dispute_id, message_id=f"payment:{dispute.dispute_id}",
                 kind="approval" if authorization.action == PaymentAction.OPS_APPROVAL else "escalation",
                 reason=authorization.reason)
+            ops_event = "approval_creation" if authorization.action == PaymentAction.OPS_APPROVAL else "escalation"
         elif route and authorization.action == PaymentAction.NO_PAYMENT:
             OpsService(session).mark_resolved(dispute.rider_id, dispute.dispute_id)
         session.commit()
+        self._trace_authorization(dispute.rider_id, dispute.dispute_id, authorization)
+        if ops_event:
+            recorder = TraceRecorder(self.session_factory, dispute.rider_id)
+            identifier = recorder.start(ops_event, {"dispute_id": dispute.dispute_id}, kind="decision")
+            recorder.finish(identifier, output={"type": output["ops_record"]["type"],
+                "amount": output["ops_record"]["amount"]})
         if not route:
             raise PaymentPolicyDenied(authorization.reason)
         return output
@@ -175,7 +205,7 @@ class PaymentService:
                     raise PaymentPolicyDenied("Dispute not found for the authenticated rider")
                 attempts = session.scalars(select(PaymentAttempt).where(PaymentAttempt.rider_id == rider_id)).all()
                 try:
-                    payments = list_rider_payments(provider, rider_id)
+                    payments = traced_list_rider_payments(self.session_factory, provider, rider_id)
                 except Exception:
                     if not route:
                         raise
@@ -193,11 +223,13 @@ class PaymentService:
                     session.commit()
                     if route:
                         if existing.status == "processed":
-                            output = PaymentAuthorization(action=PaymentAction.NO_PAYMENT, amount=0,
-                                reason="This dispute has already been paid according to PaySwift").model_dump(mode="json")
+                            authorization = PaymentAuthorization(action=PaymentAction.NO_PAYMENT, amount=0,
+                                reason="This dispute has already been paid according to PaySwift")
+                            output = authorization.model_dump(mode="json")
                             output["payment"] = self._receipt(existing)
                             OpsService(session).mark_resolved(rider_id, dispute_id)
                             session.commit()
+                            self._trace_authorization(rider_id, dispute_id, authorization)
                             return output
                         return self._authorization_outcome(session, dispute, PaymentAuthorization(
                             action=PaymentAction.ESCALATION, amount=0,
@@ -245,12 +277,16 @@ class PaymentService:
                             expected_revision=dispute.revision)
                         OpsService(session).mark_resolved(rider_id, dispute_id)
                         session.commit()
+                        self._trace_authorization(rider_id, dispute_id, PaymentAuthorization(
+                            action=PaymentAction.NO_PAYMENT, amount=0,
+                            reason="Existing PaySwift payout reconciled"))
                         return {"action": PaymentAction.NO_PAYMENT.value,
                             "amount": 0, "reason": "Existing PaySwift payout reconciled",
                             "payment": self._receipt(attempt)}
-                    return self._authorization_outcome(session, dispute, PaymentAuthorization(
+                    authorization = PaymentAuthorization(
                         action=PaymentAction.ESCALATION, amount=0,
-                        reason="PaySwift shows an existing or inconsistent payout for this dispute"), route=route)
+                        reason="PaySwift shows an existing or inconsistent payout for this dispute")
+                    return self._authorization_outcome(session, dispute, authorization, route=route)
                 authorization = authorize_dispute_payment(calculated, rider_id, payments=payments, attempts=attempts,
                     now=now, pending_review=None if ops_approved else pending_review)
                 if ops_approved and pending is not None and authorization.action in {
@@ -280,18 +316,27 @@ class PaymentService:
                     raise PaymentPolicyDenied("Another payment already reserved this dispute or rider/day") from exc
                 attempt_id, reference, key = attempt.attempt_id, attempt.reference, attempt.idempotency_key
 
+            self._trace_authorization(rider_id, dispute_id, authorization)
+
             try:
                 # Check ownership/deadline again after the durable reservation and
                 # immediately before money can move. Never ask the model.
                 if self.execution_guard:
                     self.execution_guard()
+                provider_trace = TraceRecorder(self.session_factory, rider_id)
+                provider_step = provider_trace.start("payswift_create_payout",
+                    {"dispute_id": dispute_id, "amount": amount}, kind="tool_call")
                 result = provider.create_payout(rider_id, amount, reference, key)
                 if result.get("status") != "processed" or any(
                     field in result and result[field] != value
                     for field, value in [("rider_id", rider_id), ("amount", amount), ("reference", reference)]
                 ):
                     raise PaySwiftProtocolError("Payment acknowledgement is not a matching processed payment")
+                provider_trace.finish(provider_step, output={"status": result["status"],
+                    "amount": amount, "payout_id": result["payout_id"]})
             except Exception as exc:
+                if "provider_trace" in locals() and "provider_step" in locals():
+                    provider_trace.finish(provider_step, error=exc)
                 with self.session_factory() as session:
                     attempt = session.get(PaymentAttempt, attempt_id)
                     attempt.status = "unknown"

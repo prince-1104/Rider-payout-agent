@@ -85,7 +85,9 @@ def test_concurrent_payments_cannot_reserve_more_than_one_rider_day(tmp_path, mo
         assert len(calls) == 1
         with factory() as session:
             assert session.scalar(select(func.count()).select_from(PaymentAttempt)) == 1
-            assert session.scalar(select(func.count()).select_from(TraceEvent).where(TraceEvent.type == "decision")) == 2
+            decisions = session.scalars(select(TraceEvent).where(TraceEvent.type == "decision")).all()
+            assert sum(event.name == "application_auto_payment" for event in decisions) == 2
+            assert any(event.name == "payment_authorization" for event in decisions)
     finally:
         engine.dispose()
         get_settings.cache_clear()

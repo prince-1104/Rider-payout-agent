@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.agent.tools import ToolContext, build_toolset
-from app.agent.tools.base import ToolAccessError
+from app.agent.tools.base import ToolAccessError, trace_tool_output
 from app.db.models import Conversation, PayoutLine, Rider, TraceEvent, Trip
 from app.domain.dispute import DisputeRequest
 from app.domain.dispute_types import DisputeType
@@ -141,10 +141,14 @@ def test_every_tool_returns_scoped_results_and_persistent_trace(toolset, session
     else:
         assert output == []
     traces = get_trace(session, "R003")
-    assert len(traces) == 1
-    assert traces[0].name == name and traces[0].type == "tool_call"
-    assert traces[0].input == {"arguments": arguments}
-    assert traces[0].output == output
+    provider_read = name in {"get_payments_today", "check_auto_payment_eligibility"}
+    assert len(traces) == (2 if provider_read else 1)
+    tool_event = next(step for step in traces if step.name == name)
+    assert tool_event.type == "tool_call"
+    assert tool_event.input == {"arguments": arguments}
+    assert tool_event.output == trace_tool_output(name, output)
+    if provider_read:
+        assert next(step for step in traces if step.name == "payswift_get_payouts").type == "tool_call"
     assert not get_trace(session, "R005")
     assert all(dict(call.url.params) == {"rider_id": "R003"} for call in provider[1])
 
@@ -257,8 +261,10 @@ def test_async_tool_invocation_uses_same_durable_auditing(toolset, session):
 def test_every_tool_async_invocation_is_scoped_and_traced(toolset, session, name, arguments):
     output = asyncio.run(tool(toolset, name).ainvoke(arguments))
     trace = get_trace(session, "R003")
-    assert len(trace) == 1 and trace[0].name == name
-    assert trace[0].output == output
+    provider_read = name in {"get_payments_today", "check_auto_payment_eligibility"}
+    assert len(trace) == (2 if provider_read else 1)
+    tool_event = next(step for step in trace if step.name == name)
+    assert tool_event.output == trace_tool_output(name, output)
     assert not get_trace(session, "R005")
 
 
@@ -269,7 +275,7 @@ def test_trusted_identity_is_normalized_before_queries_provider_and_auditing(see
     assert tool(capabilities, "get_rider_context").invoke({})["registered"]
     assert tool(capabilities, "reconcile_trip_payout").invoke({"trip_id": "T926334"})["amount_owed"] == 25
     assert tool(capabilities, "get_payments_today").invoke({}) == []
-    assert len(get_trace(session, "R003")) == 3
+    assert len(get_trace(session, "R003")) == 4
     assert not get_trace(session, " r3 ")
     assert provider[1][0].url.params["rider_id"] == "R003"
 
@@ -295,5 +301,9 @@ def test_trace_endpoint_returns_ordered_invocations(toolset, client):
     tool(toolset, "get_trip").invoke({"trip_id": "T926334"})
     result = client.get("/trace/R003")
     assert result.status_code == 200
-    assert [step["name"] for step in result.json()] == ["get_rider_context", "get_trip"]
-    assert all(set(step) >= {"at", "type", "name", "input", "output"} for step in result.json())
+    steps = result.json()
+    assert [step["name"] for step in steps] == ["get_rider_context", "get_trip"]
+    assert all(set(step) == {"at", "type", "name", "input", "output"} for step in steps)
+    assert [step["at"] for step in steps] == sorted(step["at"] for step in steps)
+    assert {step["type"] for step in steps} <= {"message_in", "tool_call", "decision", "reply", "error"}
+    assert "name" not in steps[0]["output"] and "city" not in steps[0]["output"]

@@ -92,7 +92,8 @@ def test_application_normalizes_trusted_identity_before_payment_and_trace(seeded
     result = payment_service(session_factory, sandbox).pay_dispute(" r3 ", "D3")
     assert result["status"] == "processed" and result["amount"] == 25
     assert json.loads(posts(sandbox)[0].content)["rider_id"] == "R003"
-    event = session.scalars(select(TraceEvent).where(TraceEvent.type == "decision")).one()
+    event = session.scalars(select(TraceEvent).where(
+        TraceEvent.type == "decision", TraceEvent.name == "application_auto_payment")).one()
     assert event.rider_id == "R003"
 
 
