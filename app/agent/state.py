@@ -107,3 +107,4 @@ class AgentState(BaseModel):
     trace: list[TraceStep] = Field(default_factory=list)
     agent_iterations: int = 0
     execution_results: list[dict[str, Any]] = Field(default_factory=list)
+    security_flags: list[str] = Field(default_factory=list)

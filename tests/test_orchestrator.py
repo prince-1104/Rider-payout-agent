@@ -117,7 +117,7 @@ def test_fixed_three_agent_pipeline_pays_only_engine_amount(workflow, remote, se
     assert "₹25" in state.reply and "9000" not in state.reply
     assert list(state.investigation_results[0].evidence) == [
         "get_trip", "get_rider_payouts", "calculate_trip_expected_payout", "reconcile_trip_payout"]
-    assert [t.name for t in state.trace] == ["load_conversation", "conversation_agent", "validate_claims",
+    assert [t.name for t in state.trace] == ["load_conversation", "classify_input", "conversation_agent", "validate_claims",
         "investigation_agent", "deterministic_dispute_engine", "policy_provider_ledger", "deterministic_policy_engine",
         "resolution_agent", "application_execute", "final_response"]
     persisted = get_trace(session, "R003")
@@ -298,7 +298,7 @@ def test_unstructured_or_failed_model_calls_are_traced_and_escalated(workflow, r
     state = run(workflow, MockStructuredModel(bad_output))
     assert state.policy_decision[0].action == Action.ESCALATION
     assert not remote.calls
-    assert state.trace[1].type == "error"
+    assert next(t for t in state.trace if t.name == "conversation_agent").type == "error"
 
 
 def test_provider_failure_escalates_and_never_claims_payment(workflow, remote):

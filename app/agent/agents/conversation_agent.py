@@ -6,4 +6,5 @@ from app.agent.state import ConversationOutput
 
 class ConversationAgent(StructuredAgent):
     def __init__(self, model):
-        super().__init__(model, "conversation.txt", ConversationOutput)
+        super().__init__(model, "conversation.txt", ConversationOutput,
+                         ("latest_message", "conversation_history", "reference_ist_date", "active_claims"))

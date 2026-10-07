@@ -4,6 +4,7 @@ from app.agent.agents.base import StructuredAgent
 from app.agent.state import EvidencePath, InvestigationJob, InvestigationPlan, InvestigationResult
 from app.domain.dispute_types import INCENTIVE_TYPES, PENALTY_TYPES, DisputeType
 from app.domain.policy import is_dispute_within_window
+from app.agent.security import claim_data, guard_untrusted_data
 
 
 def evidence_jobs(claims, today=None):
@@ -29,11 +30,11 @@ def evidence_jobs(claims, today=None):
 
 class InvestigationAgent(StructuredAgent):
     def __init__(self, model):
-        super().__init__(model, "investigation.txt", InvestigationPlan)
+        super().__init__(model, "investigation.txt", InvestigationPlan, ("claims", "allowed_jobs"))
 
     def investigate(self, claims, tools, today):
         expected = evidence_jobs(claims, today)
-        plan = self.invoke({"claims": [c.model_dump(mode="json") for c in claims],
+        plan = self.invoke({"claims": [claim_data(c) for c in claims],
                             "allowed_jobs": [j.model_dump(mode="json") for j in expected]})
         if plan.jobs != expected:
             raise ValueError("Investigation must follow the complete validated evidence plan")
@@ -43,7 +44,9 @@ class InvestigationAgent(StructuredAgent):
             evidence = {}
 
             def read(name, arguments):
-                evidence[name] = tools[name].invoke(arguments)
+                result = tools[name].invoke(arguments)
+                guard_untrusted_data(result)
+                evidence[name] = result
                 return evidence[name]
 
             if job.path == EvidencePath.TRIP:

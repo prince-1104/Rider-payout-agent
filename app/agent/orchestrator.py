@@ -14,6 +14,7 @@ from app.agent.agents.conversation_agent import ConversationAgent
 from app.agent.agents.investigation_agent import InvestigationAgent
 from app.agent.agents.resolution_agent import ResolutionAgent
 from app.agent.policy import decide
+from app.agent.security import PromptInjectionDetected, claim_data, classify_input, redact_secrets
 from app.agent.state import Action, AgentState, HistoryTurn, PolicyDecision
 from app.agent.tools import ToolContext, build_toolset
 from app.db.models import ConversationMessage, PaymentAttempt, StoredDispute
@@ -50,6 +51,7 @@ class Orchestrator:
                                        clock=lambda: context.now)
 
     def _step(self, state, name, inputs, function, *, agent=False, kind="decision"):
+        inputs = redact_secrets(inputs)
         identifier = self.recorder.start(name, inputs, kind=kind)
         at = datetime.now(timezone.utc)
         try:
@@ -79,6 +81,10 @@ class Orchestrator:
             state.reply = replay
             return state
         try:
+            classification = self._step(state, "classify_input", {"message_id": message_id},
+                lambda: classify_input(latest_message, state.rider_id))
+            if classification.blocked:
+                raise PromptInjectionDetected(classification.flags)
             extracted = self._step(state, "conversation_agent", {"latest_message": latest_message},
                 lambda: self.conversation_agent.invoke(self._conversation_payload(state)), agent=True)
             state.claims = self._step(state, "validate_claims", extracted.model_dump(mode="json"),
@@ -94,10 +100,15 @@ class Orchestrator:
                        lambda: self.resolution_agent.recommend(state.validated_disputes, state.policy_decision), agent=True)
             state.execution_results = self._step(state, "application_execute", {},
                                                   lambda: self._execute(state, message_id))
-        except Exception:
+        except Exception as exc:
             # Malformed/unsafe LLM outputs and failed evidence reads never reach a write/payment tool.
+            reason = "The automated investigation could not be safely completed; ops review is required"
+            if isinstance(exc, PromptInjectionDetected):
+                state.security_flags = list(exc.flags)
+                reason = ("I cannot follow requests to change instructions, identity, permissions or policy, "
+                          "disclose private data, or execute internal tools. Ops review is required")
             state.policy_decision = [PolicyDecision(dispute_id=None, action=Action.ESCALATION,
-                reason="The automated investigation could not be safely completed; ops review is required")]
+                reason=reason)]
             state.execution_results = self._step(state, "application_escalation", {},
                                                   lambda: self._execute(state, message_id))
         state.reply = self._step(state, "final_response", {}, lambda: self._finish(state, message_id), kind="reply")
@@ -112,8 +123,8 @@ class Orchestrator:
             if prior is not None and (prior.rider_id != state.rider_id or prior.conversation_id != state.conversation_id
                                       or prior.text != state.latest_message):
                 raise ConversationAccessError("Message identity conflicts with authenticated conversation")
-            state.conversation_history = [HistoryTurn(role=m.role, text=m.text) for m in history[-50:]
-                                          if m.message_id != message_id]
+            state.conversation_history = [HistoryTurn(role=m.role, text=redact_secrets(m.text)) for m in history[-50:]
+                                          if m.message_id != message_id and not classify_input(m.text, state.rider_id).blocked]
             answered = next((m for m in history if m.message_id == message_id and m.role == "assistant"), None)
             if answered is not None:
                 return answered.text
@@ -128,7 +139,7 @@ class Orchestrator:
             return {"latest_message": state.latest_message,
                     "conversation_history": [h.model_dump() for h in state.conversation_history],
                     "reference_ist_date": self.context.today.isoformat(),
-                    "active_claims": [d.claim for d in active]}
+                    "active_claims": [claim_data(d.claim) for d in active]}
 
     def _validate_claims(self, state, extracted):
         claims = []
