@@ -5,10 +5,14 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -125,3 +129,82 @@ class PayoutLine(Base):
             f"PayoutLine(line_id={self.line_id!r}, date={self.payout_date}, "
             f"rider_id={self.rider_id!r}, type={self.line_type!r}, amt={self.amount})"
         )
+
+
+class Conversation(Base):
+    """One durable conversation per vendor-authenticated rider, even before CSV import."""
+
+    __tablename__ = "conversations"
+    __table_args__ = (
+        UniqueConstraint("rider_id", name="uq_conversations_rider_id"),
+        UniqueConstraint("conversation_id", "rider_id", name="uq_conversations_identity"),
+        CheckConstraint("message_count >= 0 AND version >= 0", name="ck_conversations_counters"),
+    )
+
+    conversation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    rider_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ConversationMessage(Base):
+    """Ordered turns; rider and assistant turns share the triggering vendor ID."""
+
+    __tablename__ = "conversation_messages"
+    __table_args__ = (
+        ForeignKeyConstraint(["conversation_id", "rider_id"],
+                             ["conversations.conversation_id", "conversations.rider_id"],
+                             ondelete="CASCADE", name="fk_conversation_messages_identity"),
+        UniqueConstraint("message_id", "role", name="uq_conversation_messages_vendor_role"),
+        UniqueConstraint("conversation_id", "sequence", name="uq_conversation_messages_sequence"),
+        CheckConstraint("role IN ('rider', 'assistant')", name="ck_conversation_messages_role"),
+        CheckConstraint("sequence > 0", name="ck_conversation_messages_sequence"),
+    )
+
+    id: Mapped[int] = mapped_column(_BigIntPK, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    rider_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class StoredDispute(Base):
+    """Persistent claim and calculation, scoped by conversation and authenticated identity."""
+
+    __tablename__ = "disputes"
+    __table_args__ = (
+        ForeignKeyConstraint(["conversation_id", "rider_id"],
+                             ["conversations.conversation_id", "conversations.rider_id"],
+                             ondelete="CASCADE", name="fk_disputes_identity"),
+        CheckConstraint("amount_owed >= 0", name="ck_disputes_nonnegative"),
+        CheckConstraint("amount_owed = 0 OR (status = 'valid' AND expected_amount IS NOT NULL "
+                        "AND actual_amount IS NOT NULL AND amount_owed <= expected_amount - actual_amount)",
+                        name="ck_disputes_verified_shortfall"),
+    )
+
+    dispute_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    rider_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    dispute_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    trip_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dispute_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    claimed_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actual_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    amount_owed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="needs_information")
+    explanation: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    evidence: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    claim: Mapped[dict] = mapped_column(JSON, nullable=False)
+    revisions: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

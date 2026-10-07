@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.models import InboundMessage
+from app.db.database import begin_savepoint
 from app.db.repositories import InboundMessageRepository
 from app.schemas.messages import InboundMessageIn
 
@@ -19,6 +20,10 @@ from app.schemas.messages import InboundMessageIn
 class Registration:
     message: InboundMessage
     is_duplicate: bool
+
+
+class MessageIdentityConflict(ValueError):
+    """A vendor ID was reused under a different authoritative request identity."""
 
 
 def register_inbound_message(session: Session, payload: InboundMessageIn) -> Registration:
@@ -30,10 +35,12 @@ def register_inbound_message(session: Session, payload: InboundMessageIn) -> Reg
 
     existing = repo.get_by_message_id(payload.message_id)
     if existing is not None:
+        if existing.rider_id != payload.rider_id:
+            raise MessageIdentityConflict("Message ID belongs to another rider")
         return Registration(message=existing, is_duplicate=True)
 
     try:
-        with session.begin_nested():
+        with begin_savepoint(session):
             message = repo.add(
                 message_id=payload.message_id,
                 rider_id=payload.rider_id,
@@ -45,6 +52,8 @@ def register_inbound_message(session: Session, payload: InboundMessageIn) -> Reg
         existing = repo.get_by_message_id(payload.message_id)
         if existing is None:
             raise
+        if existing.rider_id != payload.rider_id:
+            raise MessageIdentityConflict("Message ID belongs to another rider")
         return Registration(message=existing, is_duplicate=True)
 
     return Registration(message=message, is_duplicate=False)

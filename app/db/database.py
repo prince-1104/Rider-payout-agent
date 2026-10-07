@@ -13,6 +13,21 @@ class Base(DeclarativeBase):
     """Declarative base shared by all ORM models."""
 
 
+def begin_savepoint(session: Session):
+    """Ensure SQLite savepoints are nested inside a real outer transaction.
+
+    sqlite3's legacy transaction mode does not BEGIN before SAVEPOINT. Releasing
+    such a savepoint otherwise commits early, defeating request-level rollback.
+    PostgreSQL already starts a transaction and needs no special handling.
+    """
+    connection = session.connection()
+    if connection.dialect.name == "sqlite":
+        driver = connection.connection.driver_connection
+        if not driver.in_transaction:
+            connection.exec_driver_sql("BEGIN")
+    return session.begin_nested()
+
+
 def build_engine(database_url: str) -> Engine:
     """Create an engine with sensible pooling defaults for the given URL."""
     if database_url.startswith("sqlite"):
