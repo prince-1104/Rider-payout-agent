@@ -247,3 +247,26 @@ class PaymentAttempt(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     payout_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class OpsQueueItem(Base):
+    """Pending application-created approval/escalation; models cannot insert items."""
+
+    __tablename__ = "ops_queue_items"
+    __table_args__ = (
+        ForeignKeyConstraint(["conversation_id", "rider_id"],
+                             ["conversations.conversation_id", "conversations.rider_id"],
+                             name="fk_ops_queue_identity"),
+        CheckConstraint("(type = 'approval' AND amount IS NOT NULL AND amount > 0) OR "
+                        "(type = 'escalation' AND amount IS NULL)", name="ck_ops_queue_amount"),
+        CheckConstraint("status IN ('pending', 'resolved')", name="ck_ops_queue_status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    rider_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    dispute_id: Mapped[str | None] = mapped_column(String(128), ForeignKey("disputes.dispute_id"), nullable=True)
+    type: Mapped[str] = mapped_column(String(16), nullable=False)
+    amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

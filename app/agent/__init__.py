@@ -1,1 +1,1 @@
-"""Agent-facing capabilities. No LLM or conversation loop yet."""
+"""Rider-scoped capabilities and bounded structured-agent orchestration."""
