@@ -208,3 +208,42 @@ class StoredDispute(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class TraceEvent(Base):
+    """Durable tool invocation record, including validation and execution failures."""
+
+    __tablename__ = "trace_events"
+    id: Mapped[int] = mapped_column(_BigIntPK, primary_key=True, autoincrement=True)
+    invocation_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    rider_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    type: Mapped[str] = mapped_column(String(16), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    input: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    output: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+
+
+class PaymentAttempt(Base):
+    """A durable reservation; uniqueness also blocks concurrent auto-payment requests."""
+
+    __tablename__ = "payment_attempts"
+    __table_args__ = (
+        UniqueConstraint("dispute_id", name="uq_payment_attempts_dispute"),
+        UniqueConstraint("rider_id", "payment_date", name="uq_payment_attempts_rider_day"),
+        UniqueConstraint("idempotency_key", name="uq_payment_attempts_key"),
+        UniqueConstraint("reference", name="uq_payment_attempts_reference"),
+        CheckConstraint("amount > 0 AND amount <= 200", name="ck_payment_attempts_amount"),
+    )
+
+    attempt_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    dispute_id: Mapped[str] = mapped_column(String(128), ForeignKey("disputes.dispute_id"), nullable=False)
+    rider_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[dict] = mapped_column(JSON, nullable=False)
+    reference: Mapped[str] = mapped_column(String(256), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    payout_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
