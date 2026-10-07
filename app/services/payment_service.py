@@ -13,12 +13,15 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictInt, Val
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.db.models import Conversation, PaymentAttempt, StoredDispute
+from app.db.models import Conversation, OpsQueueItem, PaymentAttempt, StoredDispute
 from app.domain.dispute import DisputeRequest
 from app.domain.dispute_types import DisputeStatus, INCENTIVE_TYPES
 from app.domain.policy import AUTO_PAYMENT_LIMIT_RUPEES, normalize_rider_id, to_ist_date
 from app.integrations.payswift import PaySwiftClient, PaySwiftProtocolError
 from app.services.dispute_service import DisputeService
+from app.services.conversation_service import ConversationService
+from app.services.ops_service import OpsService
+from app.services.payment_authorization import PaymentAction, PaymentAuthorization, authorize_dispute_payment
 from app.services.trace import TraceRecorder
 
 
@@ -106,15 +109,24 @@ class PaymentService:
         self.clock = clock
 
     def pay_dispute(self, authenticated_rider_id: str, dispute_id: str) -> dict:
+        """Compatibility entry point: pay/reconcile or raise; approvals remain pending."""
+        return self._run(authenticated_rider_id, dispute_id, route=False)
+
+    def process_dispute(self, authenticated_rider_id: str, dispute_id: str) -> dict:
+        """Authorize afresh, execute AUTO_PAY or persist pending ops work. No amount input."""
+        return self._run(authenticated_rider_id, dispute_id, route=True)
+
+    def _run(self, authenticated_rider_id, dispute_id, *, route):
         if not isinstance(authenticated_rider_id, str) or not authenticated_rider_id.strip():
             raise ValueError("Authenticated rider identity is required")
         authenticated_rider_id = normalize_rider_id(authenticated_rider_id)
         if len(authenticated_rider_id) > 32:
             raise ValueError("Authenticated rider identity exceeds the supported length")
         trace = TraceRecorder(self.session_factory, authenticated_rider_id)
-        identifier = trace.start("application_auto_payment", {"dispute_id": dispute_id}, kind="decision")
+        name = "application_payment_resolution" if route else "application_auto_payment"
+        identifier = trace.start(name, {"dispute_id": dispute_id}, kind="decision")
         try:
-            output = self._pay(authenticated_rider_id, dispute_id)
+            output = self._pay(authenticated_rider_id, dispute_id, route=route)
         except Exception as exc:
             trace.finish(identifier, error=exc)
             raise
@@ -126,7 +138,21 @@ class PaymentService:
         return {"attempt_id": attempt.attempt_id, "amount": attempt.amount,
                 "status": attempt.status, "payout_id": attempt.payout_id}
 
-    def _pay(self, rider_id, dispute_id):
+    def _authorization_outcome(self, session, dispute, authorization, *, route):
+        output = authorization.model_dump(mode="json")
+        if authorization.action == PaymentAction.OPS_APPROVAL or (route and authorization.action == PaymentAction.ESCALATION):
+            output["ops_record"] = OpsService(session).enqueue(dispute.rider_id, dispute.conversation_id,
+                dispute_id=dispute.dispute_id, message_id=f"payment:{dispute.dispute_id}",
+                kind="approval" if authorization.action == PaymentAction.OPS_APPROVAL else "escalation",
+                reason=authorization.reason)
+        elif route and authorization.action == PaymentAction.NO_PAYMENT:
+            OpsService(session).mark_resolved(dispute.rider_id, dispute.dispute_id)
+        session.commit()
+        if not route:
+            raise PaymentPolicyDenied(authorization.reason)
+        return output
+
+    def _pay(self, rider_id, dispute_id, *, route=False):
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("Application clock must be timezone-aware")
@@ -140,7 +166,14 @@ class PaymentService:
                 if conversation is None or dispute is None:
                     raise PaymentPolicyDenied("Dispute not found for the authenticated rider")
                 attempts = session.scalars(select(PaymentAttempt).where(PaymentAttempt.rider_id == rider_id)).all()
-                payments = list_rider_payments(provider, rider_id)
+                try:
+                    payments = list_rider_payments(provider, rider_id)
+                except Exception:
+                    if not route:
+                        raise
+                    return self._authorization_outcome(session, dispute, PaymentAuthorization(
+                        action=PaymentAction.ESCALATION, amount=0,
+                        reason="PaySwift evidence is unavailable; reconciliation is required"), route=route)
                 existing = next((a for a in attempts if a.dispute_id == dispute_id), None)
                 if existing is not None:
                     matches = [p for p in payments if p.reference == existing.reference]
@@ -150,28 +183,47 @@ class PaymentService:
                     else:
                         existing.status = "unknown"
                     session.commit()
+                    if route:
+                        if existing.status == "processed":
+                            output = PaymentAuthorization(action=PaymentAction.NO_PAYMENT, amount=0,
+                                reason="This dispute has already been paid according to PaySwift").model_dump(mode="json")
+                            output["payment"] = self._receipt(existing)
+                            OpsService(session).mark_resolved(rider_id, dispute_id)
+                            session.commit()
+                            return output
+                        return self._authorization_outcome(session, dispute, PaymentAuthorization(
+                            action=PaymentAction.ESCALATION, amount=0,
+                            reason="Existing payment outcome requires provider reconciliation"), route=route)
                     return self._receipt(existing)  # No second POST, even if ledger says missing.
-                if not dispute.is_active or dispute.status != DisputeStatus.VALID.value:
+                if not route and (not dispute.is_active or dispute.status != DisputeStatus.VALID.value):
                     raise PaymentPolicyDenied("Only an active verified dispute can be paid")
-                calculated = DisputeService(session).evaluate(rider_id, DisputeRequest.model_validate(dispute.claim), reference_date=now)
-                if calculated.status != DisputeStatus.VALID or calculated.rider_id != rider_id:
-                    raise PaymentPolicyDenied("Current dispatch/ledger data does not verify a payable shortfall")
-                amount = calculated.amount_owed
-                eligibility = auto_payment_eligibility(amount, payments, attempts, now)
-                if not eligibility["eligible"]:
-                    raise PaymentPolicyDenied(eligibility["reason"])
+                if route and (not dispute.is_active or dispute.status == DisputeStatus.NEEDS_REVIEW.value):
+                    return self._authorization_outcome(session, dispute, PaymentAuthorization(
+                        action=PaymentAction.ESCALATION, amount=0,
+                        reason="Inactive or suspicious dispute requires ops review"), route=route)
+                try:
+                    claim = DisputeRequest.model_validate(dispute.claim)
+                except ValidationError:
+                    if not route:
+                        raise
+                    return self._authorization_outcome(session, dispute, PaymentAuthorization(
+                        action=PaymentAction.ESCALATION, amount=0,
+                        reason="Malformed persisted claim requires ops review"), route=route)
+                calculated = DisputeService(session).evaluate(rider_id, claim, reference_date=now)
+                # Approval records must use the fresh engine result, not a cached
+                # balance, model amount or the rider's requested amount.
+                ConversationService(session).record_dispute_result(rider_id, conversation_id=dispute.conversation_id,
+                    result=calculated, expected_revision=dispute.revision)
+                pending = session.scalar(select(OpsQueueItem).where(OpsQueueItem.dispute_id == dispute_id,
+                    OpsQueueItem.rider_id == rider_id, OpsQueueItem.status == "pending"))
+                pending_review = (PaymentAction.OPS_APPROVAL if pending.type == "approval" else PaymentAction.ESCALATION) if pending else None
+                authorization = authorize_dispute_payment(calculated, rider_id, payments=payments, attempts=attempts,
+                    now=now, pending_review=pending_review)
+                if authorization.action != PaymentAction.AUTO_PAY:
+                    return self._authorization_outcome(session, dispute, authorization, route=route)
+                amount = authorization.amount
                 scope = {"date": calculated.dispute_date.isoformat(), "trip_id": calculated.trip_id,
                          "type": calculated.dispute_type.value}
-                by_reference = {a.reference: a for a in attempts}
-                for payment in payments:
-                    previous = by_reference.get(payment.reference)
-                    if previous is None or previous.amount != payment.amount:
-                        raise PaymentPolicyDenied("Prior provider credit is unattributed; ops must reconcile the remaining balance")
-                    if scopes_overlap(scope, previous.scope):
-                        raise PaymentPolicyDenied("A prior provider credit overlaps this dispute; ops must reconcile the remaining shortfall")
-                # Local processed records missing from the provider ledger are not proof of payment.
-                if any(not any(p.reference == a.reference for p in payments) for a in attempts):
-                    raise PaymentPolicyDenied("Application and provider ledgers disagree; reconciliation is required")
                 attempt = PaymentAttempt(attempt_id=str(uuid4()), dispute_id=dispute_id, rider_id=rider_id,
                     payment_date=to_ist_date(now), amount=amount, scope=scope,
                     reference=f"quickdrop:{rider_id}:{dispute_id}", idempotency_key=str(uuid4()), status="reserved")
@@ -195,9 +247,21 @@ class PaymentService:
                     attempt = session.get(PaymentAttempt, attempt_id)
                     attempt.status = "unknown"
                     session.commit()
+                    if route:
+                        stored = session.get(StoredDispute, dispute_id)
+                        return self._authorization_outcome(session, stored, PaymentAuthorization(
+                            action=PaymentAction.ESCALATION, amount=0,
+                            reason="Payment outcome is unknown; reconcile PaySwift before further action"), route=route)
                 raise PaymentOutcomeUnknown("Payment outcome is unknown; reconcile the persisted reference before further action") from exc
             with self.session_factory() as session:
                 attempt = session.get(PaymentAttempt, attempt_id)
                 attempt.status, attempt.payout_id = "processed", result["payout_id"]
+                if route:
+                    stored = session.get(StoredDispute, dispute_id)
+                    ConversationService(session).resolve_dispute(rider_id, conversation_id=stored.conversation_id,
+                        dispute_id=dispute_id, expected_revision=stored.revision)
+                    OpsService(session).mark_resolved(rider_id, dispute_id)
                 session.commit()
+                if route:
+                    return {**authorization.model_dump(mode="json"), "payment": self._receipt(attempt)}
                 return self._receipt(attempt)
