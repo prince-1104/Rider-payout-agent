@@ -75,6 +75,16 @@ class OpsService:
     def list_pending(self):
         items = self.session.scalars(select(OpsQueueItem).where(OpsQueueItem.status == "pending")
                                      .order_by(OpsQueueItem.created_at, OpsQueueItem.id)).all()
-        return [PendingItem(id=i.id, rider_id=i.rider_id, type=i.type, amount=i.amount,
-                            reason=i.reason, created_at=i.created_at.replace(tzinfo=timezone.utc)
-                            if i.created_at.tzinfo is None else i.created_at) for i in items]
+        result = []
+        for item in items:
+            dispute = self.session.get(StoredDispute, item.dispute_id) if item.dispute_id else None
+            result.append(PendingItem(
+                id=item.id, rider_id=item.rider_id, type=item.type, amount=item.amount,
+                reason=item.reason,
+                created_at=item.created_at.replace(tzinfo=timezone.utc)
+                if item.created_at.tzinfo is None else item.created_at,
+                dispute_type=dispute.dispute_type if dispute else None,
+                evidence=dispute.evidence if dispute else {},
+                dispute_id=item.dispute_id, conversation_id=item.conversation_id,
+            ))
+        return result

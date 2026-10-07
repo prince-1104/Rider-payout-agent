@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.database import get_session
-from app.db.models import Conversation, OpsQueueItem, StoredDispute
+from app.db.models import Conversation, ConversationMessage, OpsQueueItem, StoredDispute
 from app.schemas.conversations import ConversationState
 from app.schemas.ops import OpsDecisionReply, OpsDispute, PendingItem, RejectRequest
 from app.services.conversation_service import ConversationService
@@ -18,6 +18,29 @@ from app.services.trace import TraceRecorder
 from app.integrations.payswift import PaySwiftClient
 
 router = APIRouter(prefix="/ops", tags=["ops"])
+
+
+@router.get("/conversations/{conversation_id}")
+def get_conversation_detail(conversation_id: str, session: Annotated[Session, Depends(get_session)]) -> dict:
+    conversation = session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages = session.scalars(select(ConversationMessage).where(
+        ConversationMessage.conversation_id == conversation_id,
+        ConversationMessage.rider_id == conversation.rider_id,
+    ).order_by(ConversationMessage.sequence)).all()
+    disputes = session.scalars(select(StoredDispute).where(
+        StoredDispute.conversation_id == conversation_id,
+        StoredDispute.rider_id == conversation.rider_id,
+    ).order_by(StoredDispute.created_at, StoredDispute.dispute_id)).all()
+    return {
+        "conversation_id": conversation.conversation_id,
+        "rider_id": conversation.rider_id,
+        "state": conversation.state,
+        "messages": [{"role": m.role, "text": m.text, "at": m.received_at, "sequence": m.sequence}
+                     for m in messages],
+        "disputes": [OpsDispute.from_model(d).model_dump(mode="json") for d in disputes],
+    }
 
 
 @router.get("/pending", response_model=list[PendingItem])

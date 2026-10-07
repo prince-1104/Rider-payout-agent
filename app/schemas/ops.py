@@ -15,6 +15,10 @@ class PendingItem(BaseModel):
     amount: int | None = Field(default=None, description="Whole rupees; set for approvals, null for escalations.")
     reason: str
     created_at: datetime
+    dispute_type: str | None = None
+    evidence: dict = Field(default_factory=dict)
+    dispute_id: str | None = None
+    conversation_id: str | None = None
 
 
 class OpsDispute(BaseModel):
