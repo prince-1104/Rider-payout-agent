@@ -43,6 +43,8 @@ def calculate_trip_fare(
     """
     base_dist_fare = calculate_base_and_distance_fare(distance_km)
     surge = Decimal(str(surge_multiplier))
+    if not surge.is_finite() or surge <= 0:
+        raise ValueError("Surge multiplier must be finite and positive")
     total_fare = base_dist_fare * surge
     # Round to nearest rupee, 0.5 rounds up
     return int(total_fare.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
@@ -66,6 +68,8 @@ def calculate_daily_incentive(completed_trips_count: int) -> int:
 
     Threshold: >= 12 completed trips yields ₹150 incentive.
     """
+    if type(completed_trips_count) is not int or completed_trips_count < 0:
+        raise ValueError("Completed trip count must be a nonnegative integer")
     if completed_trips_count >= DAILY_INCENTIVE_THRESHOLD:
         return DAILY_INCENTIVE_RUPEES
     return 0

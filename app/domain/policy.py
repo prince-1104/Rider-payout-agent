@@ -61,6 +61,8 @@ def normalize_distance_km(distance: Union[Decimal, float, str, int]) -> Decimal:
     Values below 100 represent kilometers directly.
     """
     d = Decimal(str(distance))
+    if not d.is_finite() or d < 0:
+        raise ValueError("Distance must be finite and nonnegative")
     if d >= Decimal("100"):
         return d / Decimal("1000")
     return d
