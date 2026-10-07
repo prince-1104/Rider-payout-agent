@@ -1,0 +1,10 @@
+[project]
+name = "quickdrop-dispute-desk"
+version = "0.1.0"
+description = "QuickDrop Rider Payout Dispute Desk"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
