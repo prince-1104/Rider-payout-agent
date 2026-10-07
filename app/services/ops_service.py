@@ -42,9 +42,35 @@ class OpsService:
 
     def mark_resolved(self, rider_id, dispute_id):
         items = self.session.scalars(select(OpsQueueItem).where(
-            OpsQueueItem.rider_id == rider_id, OpsQueueItem.dispute_id == dispute_id)).all()
+            OpsQueueItem.rider_id == rider_id, OpsQueueItem.dispute_id == dispute_id,
+            OpsQueueItem.status == "pending")).all()
         for item in items:
             item.status = "resolved"
+
+    def mark_rejected(self, item, reason):
+        if item.status != "pending":
+            raise ValueError("Ops item is no longer pending")
+        item.status = "rejected"
+        item.resolution_reason = reason
+        self.session.flush()
+
+    def get_item(self, item_id, *, pending_only=False):
+        query = select(OpsQueueItem).where(OpsQueueItem.id == item_id)
+        if pending_only:
+            query = query.where(OpsQueueItem.status == "pending")
+        return self.session.scalar(query.with_for_update())
+
+    def get_pending_dispute_item(self, dispute_id):
+        return self.session.scalar(select(OpsQueueItem).where(
+            OpsQueueItem.dispute_id == dispute_id, OpsQueueItem.status == "pending",
+        ).order_by(OpsQueueItem.created_at, OpsQueueItem.id).with_for_update())
+
+    def list_disputes(self):
+        return list(self.session.scalars(select(StoredDispute).order_by(
+            StoredDispute.created_at.desc(), StoredDispute.dispute_id)))
+
+    def get_dispute(self, dispute_id):
+        return self.session.get(StoredDispute, dispute_id)
 
     def list_pending(self):
         items = self.session.scalars(select(OpsQueueItem).where(OpsQueueItem.status == "pending")

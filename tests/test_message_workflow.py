@@ -1,7 +1,7 @@
 """End-to-end webhook tests with structured LLM and PaySwift mocks."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from app.agent.state import ConversationOutput, InvestigationPlan, ResolutionOutput
 from app.db.database import get_session
-from app.db.models import InboundMessage, OpsQueueItem, Trip
+from app.db.models import ConversationMessage, InboundMessage, OpsQueueItem, PayoutLine, StoredDispute, TraceEvent, Trip
 from app.integrations.payswift import PaySwiftClient
 from app.main import create_app
 from app.services.trace import get_trace
@@ -185,3 +185,112 @@ def test_prompt_injection_webhook_escalates_without_payment(webhook):
         assert client.get("/ops/pending").json()[0]["type"] == "escalation"
     assert provider.calls == []
     assert model.calls == []
+
+
+def _create_approval(client):
+    return client.post("/messages", json={"message_id": "IN-OPS", "rider_id": "R016",
+        "text": "19 Sep payout wrong", "received_at": "2026-09-22T09:05:00+05:30"})
+
+
+def test_ops_dispute_listing_and_detail(webhook, session_factory):
+    build, _ = webhook
+    model = StructuredMock(lambda _: extraction(claim("general_payout_dispute", dispute_date="2026-09-19")))
+    with build(model) as client:
+        assert _create_approval(client).status_code == 200
+        items = client.get("/ops/disputes")
+        assert items.status_code == 200 and items.json()
+        with session_factory() as session:
+            pending = next(row for row in client.get("/ops/pending").json() if row["rider_id"] == "R016")
+            dispute_id = session.get(OpsQueueItem, pending["id"]).dispute_id
+        detail = client.get(f"/ops/disputes/{dispute_id}")
+        assert detail.status_code == 200
+        assert detail.json()["amount_owed"] > 0
+        assert client.get("/ops/disputes/missing").status_code == 404
+
+
+def test_ops_approval_recalculates_and_ignores_frontend_amount(webhook, session_factory):
+    build, provider = webhook
+    model = StructuredMock(lambda _: extraction(claim("general_payout_dispute", dispute_date="2026-09-19")))
+    with build(model) as client:
+        assert _create_approval(client).status_code == 200
+        pending = client.get("/ops/pending").json()
+        approval = next(item for item in pending if item["rider_id"] == "R016")
+        # Queue IDs and dispute IDs are separate; obtain the pending item's linked dispute.
+        with session_factory() as session:
+            queue = session.get(OpsQueueItem, approval["id"])
+            dispute_id = queue.dispute_id
+            owed = session.get(StoredDispute, dispute_id).amount_owed
+        response = client.post(f"/ops/disputes/{dispute_id}/approve", json={"amount": 999999})
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "resolved"
+    assert response.json()["amount"] == owed
+    posted = [call for call in provider.calls if call.method == "POST"]
+    assert len(posted) == 1 and json.loads(posted[0].content)["amount"] == owed
+    with session_factory() as session:
+        queue = session.get(OpsQueueItem, approval["id"])
+        assert queue.status == "resolved"
+        assert queue.amount == owed
+        events = session.query(TraceEvent).filter_by(name="ops_approved_payment", rider_id="R016").all()
+        assert events
+
+
+def test_ops_approval_recalculates_changed_shortfall(webhook, session_factory):
+    build, provider = webhook
+    model = StructuredMock(lambda _: extraction(claim("general_payout_dispute", dispute_date="2026-09-19")))
+    with build(model) as client:
+        assert _create_approval(client).status_code == 200
+        approval = next(item for item in client.get("/ops/pending").json() if item["rider_id"] == "R016")
+        with session_factory() as session:
+            dispute_id = session.get(OpsQueueItem, approval["id"]).dispute_id
+            dispute = session.get(StoredDispute, dispute_id)
+            before = dispute.amount_owed
+            trip_id = session.scalar(select(Trip.trip_id).where(
+                Trip.rider_id == "R016", Trip.started_at >= datetime(2026, 9, 19, tzinfo=timezone.utc),
+                Trip.started_at < datetime(2026, 9, 20, tzinfo=timezone.utc)).limit(1))
+            session.add(PayoutLine(line_id="OPS-LATE-CREDIT", rider_id="R016", trip_id=trip_id,
+                payout_date=dispute.dispute_date, line_type="trip", amount=before - 80))
+            session.commit()
+        response = client.post(f"/ops/disputes/{dispute_id}/approve")
+    assert response.status_code == 200, response.text
+    assert response.json()["amount"] == 80
+    assert json.loads(next(call for call in provider.calls if call.method == "POST").content)["amount"] == 80
+
+
+def test_ops_approval_reconciles_paySwift_as_source_of_truth(webhook, session_factory):
+    build, provider = webhook
+    model = StructuredMock(lambda _: extraction(claim("general_payout_dispute", dispute_date="2026-09-19")))
+    with build(model) as client:
+        assert _create_approval(client).status_code == 200
+        pending = next(item for item in client.get("/ops/pending").json() if item["rider_id"] == "R016")
+        with session_factory() as session:
+            dispute_id = session.get(OpsQueueItem, pending["id"]).dispute_id
+            amount = session.get(StoredDispute, dispute_id).amount_owed
+        provider.ledger.append({"payout_id": "PAY-ALREADY", "rider_id": "R016", "amount": amount,
+            "reference": f"quickdrop:R016:{dispute_id}", "status": "processed", "created_at": NOW.isoformat()})
+        response = client.post(f"/ops/disputes/{dispute_id}/approve")
+    assert response.status_code == 200 and response.json()["payout_id"] == "PAY-ALREADY"
+    assert not [call for call in provider.calls if call.method == "POST"]
+    with session_factory() as session:
+        assert session.scalar(select(OpsQueueItem).where(OpsQueueItem.id == pending["id"])).status == "resolved"
+
+
+def test_ops_rejection_persists_reason_and_replies_in_active_conversation(webhook, session_factory):
+    build, provider = webhook
+    model = StructuredMock(lambda _: extraction(claim("general_payout_dispute", dispute_date="2026-09-19")))
+    with build(model) as client:
+        assert _create_approval(client).status_code == 200
+        pending = next(item for item in client.get("/ops/pending").json() if item["rider_id"] == "R016")
+        with session_factory() as session:
+            dispute_id = session.get(OpsQueueItem, pending["id"]).dispute_id
+        response = client.post(f"/ops/disputes/{dispute_id}/reject", json={"reason": "Evidence does not support a shortfall"})
+        assert response.status_code == 200
+        assert response.json()["status"] == "rejected"
+        assert "could not approve" in response.json()["reply"]
+        assert pending["id"] not in {item["id"] for item in client.get("/ops/pending").json()}
+    assert provider.calls and not [call for call in provider.calls if call.method == "POST"]
+    with session_factory() as session:
+        item = session.get(OpsQueueItem, pending["id"])
+        assert item.status == "rejected"
+        assert item.resolution_reason == "Evidence does not support a shortfall"
+        assert session.query(ConversationMessage).filter_by(message_id=f"ops-rejection:{item.id}").one()
+        assert session.query(TraceEvent).filter_by(name="ops_rejection", rider_id="R016").one()

@@ -12,11 +12,13 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    Index,
     JSON,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    text,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -235,10 +237,11 @@ class PaymentAttempt(Base):
     __tablename__ = "payment_attempts"
     __table_args__ = (
         UniqueConstraint("dispute_id", name="uq_payment_attempts_dispute"),
-        UniqueConstraint("rider_id", "payment_date", name="uq_payment_attempts_rider_day"),
+        Index("uq_payment_attempts_rider_day_auto", "rider_id", "payment_date", unique=True,
+              sqlite_where=text("ops_approved = 0"), postgresql_where=text("ops_approved = false")),
         UniqueConstraint("idempotency_key", name="uq_payment_attempts_key"),
         UniqueConstraint("reference", name="uq_payment_attempts_reference"),
-        CheckConstraint("amount > 0 AND amount <= 200", name="ck_payment_attempts_amount"),
+        CheckConstraint("amount > 0", name="ck_payment_attempts_amount"),
     )
 
     attempt_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -251,6 +254,7 @@ class PaymentAttempt(Base):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     payout_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ops_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
@@ -264,7 +268,7 @@ class OpsQueueItem(Base):
                              name="fk_ops_queue_identity"),
         CheckConstraint("(type = 'approval' AND amount IS NOT NULL AND amount > 0) OR "
                         "(type = 'escalation' AND amount IS NULL)", name="ck_ops_queue_amount"),
-        CheckConstraint("status IN ('pending', 'resolved')", name="ck_ops_queue_status"),
+        CheckConstraint("status IN ('pending', 'resolved', 'rejected')", name="ck_ops_queue_status"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     conversation_id: Mapped[str] = mapped_column(String(36), nullable=False)
@@ -274,4 +278,5 @@ class OpsQueueItem(Base):
     amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    resolution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

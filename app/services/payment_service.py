@@ -117,17 +117,22 @@ class PaymentService:
         """Authorize afresh, execute AUTO_PAY or persist pending ops work. No amount input."""
         return self._run(authenticated_rider_id, dispute_id, route=True)
 
-    def _run(self, authenticated_rider_id, dispute_id, *, route):
+    def approve_ops_dispute(self, authenticated_rider_id: str, dispute_id: str) -> dict:
+        """Execute a pending human-approved payment using a fresh engine amount."""
+        return self._run(authenticated_rider_id, dispute_id, route=True, ops_approved=True)
+
+    def _run(self, authenticated_rider_id, dispute_id, *, route, ops_approved=False):
         if not isinstance(authenticated_rider_id, str) or not authenticated_rider_id.strip():
             raise ValueError("Authenticated rider identity is required")
         authenticated_rider_id = normalize_rider_id(authenticated_rider_id)
         if len(authenticated_rider_id) > 32:
             raise ValueError("Authenticated rider identity exceeds the supported length")
         trace = TraceRecorder(self.session_factory, authenticated_rider_id)
-        name = "application_payment_resolution" if route else "application_auto_payment"
+        name = "ops_approved_payment" if ops_approved else (
+            "application_payment_resolution" if route else "application_auto_payment")
         identifier = trace.start(name, {"dispute_id": dispute_id}, kind="decision")
         try:
-            output = self._pay(authenticated_rider_id, dispute_id, route=route)
+            output = self._pay(authenticated_rider_id, dispute_id, route=route, ops_approved=ops_approved)
         except Exception as exc:
             trace.finish(identifier, error=exc)
             raise
@@ -153,7 +158,7 @@ class PaymentService:
             raise PaymentPolicyDenied(authorization.reason)
         return output
 
-    def _pay(self, rider_id, dispute_id, *, route=False):
+    def _pay(self, rider_id, dispute_id, *, route=False, ops_approved=False):
         if self.execution_guard:
             self.execution_guard()
         now = self.clock()
@@ -219,17 +224,54 @@ class PaymentService:
                     result=calculated, expected_revision=dispute.revision)
                 pending = session.scalar(select(OpsQueueItem).where(OpsQueueItem.dispute_id == dispute_id,
                     OpsQueueItem.rider_id == rider_id, OpsQueueItem.status == "pending"))
+                if ops_approved and (pending is None or pending.type != "approval"):
+                    raise PaymentPolicyDenied("A pending approval is required for ops payment execution")
                 pending_review = (PaymentAction.OPS_APPROVAL if pending.type == "approval" else PaymentAction.ESCALATION) if pending else None
+                reference = f"quickdrop:{rider_id}:{dispute_id}"
+                provider_matches = [p for p in payments if p.reference == reference]
+                if provider_matches:
+                    if len(provider_matches) == 1 and provider_matches[0].status == "processed" \
+                            and provider_matches[0].amount == calculated.amount_owed and calculated.amount_owed > 0:
+                        matched = provider_matches[0]
+                        attempt = PaymentAttempt(attempt_id=str(uuid4()), dispute_id=dispute_id,
+                            rider_id=rider_id, payment_date=to_ist_date(matched.created_at),
+                            amount=matched.amount, scope={"date": calculated.dispute_date.isoformat(),
+                                "trip_id": calculated.trip_id, "type": calculated.dispute_type.value},
+                            reference=reference, idempotency_key=str(uuid4()), status="processed",
+                            payout_id=matched.payout_id, ops_approved=True)
+                        session.add(attempt)
+                        ConversationService(session).resolve_dispute(rider_id,
+                            conversation_id=dispute.conversation_id, dispute_id=dispute_id,
+                            expected_revision=dispute.revision)
+                        OpsService(session).mark_resolved(rider_id, dispute_id)
+                        session.commit()
+                        return {"action": PaymentAction.NO_PAYMENT.value,
+                            "amount": 0, "reason": "Existing PaySwift payout reconciled",
+                            "payment": self._receipt(attempt)}
+                    return self._authorization_outcome(session, dispute, PaymentAuthorization(
+                        action=PaymentAction.ESCALATION, amount=0,
+                        reason="PaySwift shows an existing or inconsistent payout for this dispute"), route=route)
                 authorization = authorize_dispute_payment(calculated, rider_id, payments=payments, attempts=attempts,
-                    now=now, pending_review=pending_review)
-                if authorization.action != PaymentAction.AUTO_PAY:
+                    now=now, pending_review=None if ops_approved else pending_review)
+                if ops_approved and pending is not None and authorization.action in {
+                    PaymentAction.AUTO_PAY, PaymentAction.OPS_APPROVAL,
+                }:
+                    # Explicit ops approval may bypass the automatic amount/day cap,
+                    # but not the freshly calculated amount or any ledger anomaly.
+                    pending.amount = calculated.amount_owed
+                    authorization = PaymentAuthorization(action=PaymentAction.OPS_APPROVAL,
+                        amount=calculated.amount_owed, reason="Ops approved the freshly verified shortfall")
+                if authorization.action != PaymentAction.AUTO_PAY and not (
+                    ops_approved and authorization.action == PaymentAction.OPS_APPROVAL
+                ):
                     return self._authorization_outcome(session, dispute, authorization, route=route)
                 amount = authorization.amount
                 scope = {"date": calculated.dispute_date.isoformat(), "trip_id": calculated.trip_id,
                          "type": calculated.dispute_type.value}
                 attempt = PaymentAttempt(attempt_id=str(uuid4()), dispute_id=dispute_id, rider_id=rider_id,
                     payment_date=to_ist_date(now), amount=amount, scope=scope,
-                    reference=f"quickdrop:{rider_id}:{dispute_id}", idempotency_key=str(uuid4()), status="reserved")
+                    reference=f"quickdrop:{rider_id}:{dispute_id}", idempotency_key=str(uuid4()), status="reserved",
+                    ops_approved=ops_approved)
                 session.add(attempt)
                 try:
                     session.commit()  # Durable before the external side effect.
