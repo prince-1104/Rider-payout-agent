@@ -1,8 +1,8 @@
 """Exactly-once handling of vendor message deliveries, keyed by ``message_id`` (wamid).
 
-The insert and the stored reply are committed in one transaction. On PostgreSQL a
-concurrent delivery of the same wamid blocks on the unique index until the first
-request commits, then fails with ``IntegrityError`` and replays the stored reply.
+Registration uses a unique index and race recovery. The webhook commits inbound
+data before the workflow, claims durable processing leases, then caches the final
+reply separately. Financial reservations are durable before provider side effects.
 """
 
 from dataclasses import dataclass
@@ -29,7 +29,7 @@ class MessageIdentityConflict(ValueError):
 def register_inbound_message(session: Session, payload: InboundMessageIn) -> Registration:
     """Insert the message, or return the already-stored one if this wamid was seen before.
 
-    Does not commit; call :func:`record_reply` to finish the transaction.
+    Does not commit; the application owns transaction boundaries.
     """
     repo = InboundMessageRepository(session)
 

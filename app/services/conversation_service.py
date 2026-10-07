@@ -2,7 +2,7 @@
 
 All methods require the authoritative request rider ID. No method infers identity
 or structured claims from message text. Methods flush but never commit: callers
-commit the inbound message, conversation turns and reply as one transaction.
+choose durable transaction boundaries for each workflow stage.
 """
 
 from datetime import datetime, timezone

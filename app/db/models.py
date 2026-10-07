@@ -44,6 +44,9 @@ class InboundMessage(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     reply: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    processing_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    workflow_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -146,6 +149,8 @@ class Conversation(Base):
     state: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    workflow_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    workflow_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

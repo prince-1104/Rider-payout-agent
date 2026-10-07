@@ -1,6 +1,8 @@
 """Schemas for the vendor webhook ``POST /messages``."""
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+
+from app.domain.policy import normalize_rider_id
 
 
 class InboundMessageIn(BaseModel):
@@ -17,6 +19,11 @@ class InboundMessageIn(BaseModel):
     # Empty text is accepted: rejecting it with 4xx would only make the vendor retry forever.
     text: str = Field(max_length=4096)
     received_at: AwareDatetime = Field(description="Timezone-aware ISO-8601 timestamp.")
+
+    @field_validator("rider_id")
+    @classmethod
+    def canonical_rider(cls, value: str) -> str:
+        return normalize_rider_id(value)
 
 
 class MessageReply(BaseModel):

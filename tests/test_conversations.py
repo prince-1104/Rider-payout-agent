@@ -214,14 +214,21 @@ def test_state_cannot_set_or_focus_foreign_identity(session):
             state=ConversationState(focused_dispute_id=foreign.dispute_id), expected_version=0)
 
 
-def test_transaction_failure_rolls_back_inbound_and_conversation(client, session, monkeypatch):
+def test_cache_failure_preserves_workflow_for_safe_retry(client, session, monkeypatch):
+    from app.api.messages import record_reply
     def fail(*args, **kwargs):
         raise RuntimeError("simulated reply persistence failure")
     monkeypatch.setattr("app.api.messages.record_reply", fail)
     with pytest.raises(RuntimeError):
         client.post("/messages", json={"rider_id": "R003", "message_id": "FAIL", "text": "test", "received_at": AT.isoformat()})
-    for model in [InboundMessage, Conversation, ConversationMessage]:
-        assert session.scalar(select(func.count()).select_from(model)) == 0
+    assert session.scalar(select(func.count()).select_from(InboundMessage)) == 1
+    assert session.scalar(select(func.count()).select_from(Conversation)) == 1
+    assert session.scalar(select(func.count()).select_from(ConversationMessage)) == 2
+    assert session.scalars(select(InboundMessage)).one().reply is None
+    monkeypatch.setattr("app.api.messages.record_reply", record_reply)
+    response = client.post("/messages", json={"rider_id": "R003", "message_id": "FAIL", "text": "changed retry", "received_at": AT.isoformat()})
+    assert response.status_code == 200
+    assert session.scalar(select(func.count()).select_from(ConversationMessage)) == 2
 
 
 def test_state_survives_database_engine_restart(tmp_path):

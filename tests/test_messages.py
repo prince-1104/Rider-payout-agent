@@ -5,7 +5,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.messages import PLACEHOLDER_REPLY
 from app.db.models import InboundMessage
 
 
@@ -20,18 +19,20 @@ def _payload(**overrides: Any) -> dict[str, Any]:
     return body
 
 
-def test_valid_message_returns_placeholder_reply_and_is_persisted(
+def test_valid_message_without_model_returns_durable_escalation(
     client: TestClient, session: Session
 ) -> None:
     response = client.post("/messages", json=_payload())
 
     assert response.status_code == 200
-    assert response.json() == {"reply": PLACEHOLDER_REPLY}
+    assert set(response.json()) == {"reply"}
+    assert "queued for ops review" in response.json()["reply"]
 
     stored = session.scalars(select(InboundMessage)).one()
     assert stored.message_id == "wamid.KAZ5TCF7RARUVH"
     assert stored.rider_id == "R003"
-    assert stored.reply == PLACEHOLDER_REPLY
+    assert stored.reply == response.json()["reply"]
+    assert stored.workflow_state["policy_decision"][0]["action"] == "ESCALATION"
 
 
 @pytest.mark.parametrize("missing", ["message_id", "rider_id", "text", "received_at"])

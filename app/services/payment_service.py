@@ -103,10 +103,11 @@ class PaymentService:
     """Only trusted application code supplies rider/dispute IDs. No amount argument."""
 
     def __init__(self, session_factory, *, payswift_factory=PaySwiftClient,
-                 clock=lambda: datetime.now(timezone.utc)):
+                 clock=lambda: datetime.now(timezone.utc), execution_guard=None):
         self.session_factory = session_factory
         self.payswift_factory = payswift_factory
         self.clock = clock
+        self.execution_guard = execution_guard
 
     def pay_dispute(self, authenticated_rider_id: str, dispute_id: str) -> dict:
         """Compatibility entry point: pay/reconcile or raise; approvals remain pending."""
@@ -153,6 +154,8 @@ class PaymentService:
         return output
 
     def _pay(self, rider_id, dispute_id, *, route=False):
+        if self.execution_guard:
+            self.execution_guard()
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("Application clock must be timezone-aware")
@@ -236,6 +239,10 @@ class PaymentService:
                 attempt_id, reference, key = attempt.attempt_id, attempt.reference, attempt.idempotency_key
 
             try:
+                # Check ownership/deadline again after the durable reservation and
+                # immediately before money can move. Never ask the model.
+                if self.execution_guard:
+                    self.execution_guard()
                 result = provider.create_payout(rider_id, amount, reference, key)
                 if result.get("status") != "processed" or any(
                     field in result and result[field] != value

@@ -37,24 +37,27 @@ class AgentIterationLimit(RuntimeError):
 class Orchestrator:
     MAX_AGENT_ITERATIONS = 5
 
-    def __init__(self, context: ToolContext, model, *, max_iterations=5):
+    def __init__(self, context: ToolContext, model, *, max_iterations=5, step_guard=None, payment_guard=None):
         if type(max_iterations) is not int or not 1 <= max_iterations <= self.MAX_AGENT_ITERATIONS:
             raise ValueError("max_iterations must be between 1 and 5")
         self.context = context
         self.max_iterations = max_iterations
+        self.step_guard = step_guard
         self.conversation_agent = ConversationAgent(model)
         self.investigation_agent = InvestigationAgent(model)
         self.resolution_agent = ResolutionAgent(model)
         self.tools = {t.name: t for t in build_toolset(context).read_tools}
         self.recorder = TraceRecorder(context.session_factory, context.rider_id)
         self.payments = PaymentService(context.session_factory, payswift_factory=context.payswift_factory,
-                                       clock=lambda: context.now)
+                                       clock=lambda: context.now, execution_guard=payment_guard)
 
     def _step(self, state, name, inputs, function, *, agent=False, kind="decision"):
         inputs = redact_secrets(inputs)
         identifier = self.recorder.start(name, inputs, kind=kind)
         at = datetime.now(timezone.utc)
         try:
+            if self.step_guard:
+                self.step_guard(name)
             if agent:
                 if state.agent_iterations >= self.max_iterations:
                     raise AgentIterationLimit("Agent iteration limit reached")
@@ -70,13 +73,14 @@ class Orchestrator:
         state.trace.append(TraceStep(at=at, type=kind, name=name, input=inputs, output=encoded))
         return output
 
-    def run(self, *, conversation_id: str, message_id: str, latest_message: str) -> AgentState:
+    def run(self, *, conversation_id: str, message_id: str, latest_message: str,
+            received_at: datetime | None = None) -> AgentState:
         if not isinstance(latest_message, str) or len(latest_message) > 4096:
             raise ValueError("latest_message must be text of at most 4096 characters")
         state = AgentState(rider_id=self.context.rider_id, conversation_id=conversation_id,
                            latest_message=latest_message)
         replay = self._step(state, "load_conversation", {"conversation_id": conversation_id, "message_id": message_id},
-                            lambda: self._load(state, message_id), kind="message_in")
+                            lambda: self._load(state, message_id, received_at), kind="message_in")
         if replay is not None:
             state.reply = replay
             return state
@@ -114,7 +118,7 @@ class Orchestrator:
         state.reply = self._step(state, "final_response", {}, lambda: self._finish(state, message_id), kind="reply")
         return state
 
-    def _load(self, state, message_id):
+    def _load(self, state, message_id, received_at=None):
         with self.context.session_factory() as session:
             service = ConversationService(session)
             history = service.get_conversation_history(state.rider_id, conversation_id=state.conversation_id)
@@ -129,7 +133,7 @@ class Orchestrator:
             if answered is not None:
                 return answered.text
             service.append_message(state.rider_id, conversation_id=state.conversation_id, message_id=message_id,
-                                   text=state.latest_message, received_at=self.context.now)
+                                   text=state.latest_message, received_at=received_at or self.context.now)
             session.commit()
         return None
 
