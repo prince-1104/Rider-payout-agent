@@ -21,6 +21,17 @@ class PendingItem(BaseModel):
     conversation_id: str | None = None
 
 
+class ConversationSummary(BaseModel):
+    conversation_id: str
+    rider_id: str
+    state: dict
+    created_at: datetime
+    updated_at: datetime
+    active_dispute_count: int
+    latest_message_preview: str | None = None
+    latest_message_at: datetime | None = None
+
+
 class OpsDispute(BaseModel):
     dispute_id: str
     rider_id: str

@@ -20,6 +20,8 @@ services:
 
   api:
     build: .
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql+psycopg://quickdrop:quickdrop@db:5432/quickdrop
       PAYSWIFT_BASE_URL: http://payswift:8081

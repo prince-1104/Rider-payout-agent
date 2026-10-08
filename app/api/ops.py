@@ -4,13 +4,13 @@ from typing import Annotated
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.database import get_session
 from app.db.models import Conversation, ConversationMessage, OpsQueueItem, StoredDispute
 from app.schemas.conversations import ConversationState
-from app.schemas.ops import OpsDecisionReply, OpsDispute, PendingItem, RejectRequest
+from app.schemas.ops import ConversationSummary, OpsDecisionReply, OpsDispute, PendingItem, RejectRequest
 from app.services.conversation_service import ConversationService
 from app.services.ops_service import OpsService
 from app.services.payment_service import PaymentPolicyDenied, PaymentService
@@ -18,6 +18,49 @@ from app.services.trace import TraceRecorder
 from app.integrations.payswift import PaySwiftClient
 
 router = APIRouter(prefix="/ops", tags=["ops"])
+
+
+@router.get("/conversations", response_model=list[ConversationSummary])
+def list_conversations(
+    session: Annotated[Session, Depends(get_session)],
+    rider_id: str | None = None,
+    status: str | None = None,
+) -> list[ConversationSummary]:
+    """List concise operational conversation metadata; never returns prompts or private reasoning."""
+    query = select(Conversation).order_by(Conversation.updated_at.desc(), Conversation.conversation_id)
+    if rider_id:
+        query = query.where(Conversation.rider_id == rider_id.strip().upper())
+    if status:
+        query = query.where(Conversation.state["phase"].as_string() == status)
+    conversations = list(session.scalars(query))
+    if not conversations:
+        return []
+    ids = [row.conversation_id for row in conversations]
+    active_counts = dict(session.execute(
+        select(StoredDispute.conversation_id, func.count(StoredDispute.dispute_id))
+        .where(StoredDispute.conversation_id.in_(ids), StoredDispute.is_active.is_(True))
+        .group_by(StoredDispute.conversation_id)
+    ).all())
+    latest_messages = session.scalars(
+        select(ConversationMessage)
+        .where(ConversationMessage.conversation_id.in_(ids))
+        .order_by(ConversationMessage.conversation_id, ConversationMessage.sequence.desc())
+    ).all()
+    latest_by_conversation = {}
+    for message in latest_messages:
+        latest_by_conversation.setdefault(message.conversation_id, message)
+    return [ConversationSummary(
+        conversation_id=row.conversation_id,
+        rider_id=row.rider_id,
+        state={"phase": row.state.get("phase", "awaiting_details")},
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        active_dispute_count=active_counts.get(row.conversation_id, 0),
+        latest_message_preview=(latest_by_conversation[row.conversation_id].text[:200]
+                                if row.conversation_id in latest_by_conversation else None),
+        latest_message_at=(latest_by_conversation[row.conversation_id].received_at
+                           if row.conversation_id in latest_by_conversation else None),
+    ) for row in conversations]
 
 
 @router.get("/conversations/{conversation_id}")
